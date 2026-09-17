@@ -4,17 +4,16 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.lmlinky.data.AppPreferences
-import com.example.lmlinky.data.ChatCompletionRequest
 import com.example.lmlinky.data.ChatMessage
 import com.example.lmlinky.data.ChatSession
 import com.example.lmlinky.data.LmStudioApiClient
 import com.example.lmlinky.data.ModelData
 import com.example.lmlinky.data.ServerConnection
-import kotlinx.coroutines.Job
+import com.example.lmlinky.service.GenerationEvent
+import com.example.lmlinky.service.ModelGenerationService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.UUID
@@ -64,10 +63,60 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
-    private var streamJob: Job? = null
-
     init {
         loadSessionsAndSettings()
+        observeServiceEvents()
+    }
+
+    private fun observeServiceEvents() {
+        viewModelScope.launch {
+            ModelGenerationService.isGenerating.collect { isGenerating ->
+                _uiState.update { it.copy(isGenerating = isGenerating) }
+            }
+        }
+
+        viewModelScope.launch {
+            ModelGenerationService.events.collect { event ->
+                when (event) {
+                    is GenerationEvent.Token -> {
+                        _uiState.update { currentState ->
+                            val newMsgs = currentState.messages.map { msg ->
+                                if (msg.id == event.assistantId) {
+                                    msg.copy(content = msg.content + event.token)
+                                } else msg
+                            }
+                            currentState.copy(messages = newMsgs)
+                        }
+                    }
+                    is GenerationEvent.Error -> {
+                        _uiState.update { currentState ->
+                            val newMsgs = currentState.messages.map { msg ->
+                                if (msg.id == event.assistantId) {
+                                    msg.copy(
+                                        content = if (msg.content.isEmpty()) "Error: ${event.errorMessage}" else msg.content + "\n\n[Error: ${event.errorMessage}]",
+                                        isStreaming = false,
+                                        isError = true
+                                    )
+                                } else msg
+                            }
+                            currentState.copy(messages = newMsgs, isGenerating = false)
+                        }
+                        persistActiveSession()
+                    }
+                    is GenerationEvent.Finished -> {
+                        _uiState.update { currentState ->
+                            val newMsgs = currentState.messages.map { msg ->
+                                if (msg.id == event.assistantId) {
+                                    msg.copy(isStreaming = false)
+                                } else msg
+                            }
+                            currentState.copy(messages = newMsgs, isGenerating = false)
+                        }
+                        persistActiveSession()
+                    }
+                }
+            }
+        }
     }
 
     private fun loadSessionsAndSettings() {
@@ -464,67 +513,23 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
-        val apiMessages = mutableListOf<ChatMessage>()
-        if (_uiState.value.systemPrompt.isNotBlank()) {
-            apiMessages.add(ChatMessage(role = "system", content = _uiState.value.systemPrompt))
-        }
-        apiMessages.addAll(
-            _uiState.value.messages.map { ChatMessage(role = it.role, content = it.content) }
-        )
-        apiMessages.add(ChatMessage(role = "user", content = prompt))
+        val apiMessages = _uiState.value.messages.map { ChatMessage(role = it.role, content = it.content) } +
+                ChatMessage(role = "user", content = prompt)
 
-        val request = ChatCompletionRequest(
+        ModelGenerationService.start(
+            context = getApplication(),
+            serverUrl = _uiState.value.serverUrl,
+            apiKey = _uiState.value.apiKey,
             model = _uiState.value.selectedModel,
-            messages = apiMessages,
+            systemPrompt = _uiState.value.systemPrompt,
             temperature = _uiState.value.temperature,
-            stream = true
+            messages = apiMessages,
+            assistantId = assistantMessage.id
         )
-
-        val assistantId = assistantMessage.id
-
-        streamJob = viewModelScope.launch {
-            apiClient.streamChatCompletion(_uiState.value.serverUrl, request, _uiState.value.apiKey)
-                .catch { error ->
-                    _uiState.update { currentState ->
-                        val newMsgs = currentState.messages.map { msg ->
-                            if (msg.id == assistantId) {
-                                msg.copy(
-                                    content = if (msg.content.isEmpty()) "Error: ${error.localizedMessage}" else msg.content + "\n\n[Error: ${error.localizedMessage}]",
-                                    isStreaming = false,
-                                    isError = true
-                                )
-                            } else msg
-                        }
-                        currentState.copy(messages = newMsgs, isGenerating = false)
-                    }
-                    persistActiveSession()
-                }
-                .collect { token ->
-                    _uiState.update { currentState ->
-                        val newMsgs = currentState.messages.map { msg ->
-                            if (msg.id == assistantId) {
-                                msg.copy(content = msg.content + token)
-                            } else msg
-                        }
-                        currentState.copy(messages = newMsgs)
-                    }
-                }
-
-            _uiState.update { currentState ->
-                val newMsgs = currentState.messages.map { msg ->
-                    if (msg.id == assistantId) {
-                        msg.copy(isStreaming = false)
-                    } else msg
-                }
-                currentState.copy(messages = newMsgs, isGenerating = false)
-            }
-            persistActiveSession()
-        }
     }
 
     fun stopGeneration() {
-        streamJob?.cancel()
-        streamJob = null
+        ModelGenerationService.stop(getApplication())
 
         _uiState.update { currentState ->
             val newMsgs = currentState.messages.map { msg ->
